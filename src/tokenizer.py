@@ -17,15 +17,12 @@ class GraphTokenizer:
         self.mapped_id_set = set(self.mapped_id_list)
 
         self.candidate_concepts = concept_candidate_dist_n_rel["dst.id"].unique().to_list()
-        self.candidate_concept_set = set(self.candidate_concepts)
 
         if candidate_reachable_child_map is None:
             print(
                 "Warning: candidate_reachable_child_map is None. Hierarchy-based parent removal will be disabled.",
             )
         self.candidate_reachable_child_map = candidate_reachable_child_map or {}
-
-        self.concept_candidate_dist_n_rel = concept_candidate_dist_n_rel
 
         # Main reusable table: only mapped sources, valid candidates, and allowed distance.
         self.edges_within_max = (
@@ -43,11 +40,11 @@ class GraphTokenizer:
             concept_candidate_dist_n_rel.filter(pl.col("src.id").is_in(self.mapped_id_list))
             .filter(pl.col("distance") == 1)
             .group_by("src.id")
-            .agg(pl.col("relation").n_unique().alias("num_sem_type"))
+            .agg(pl.col("relation").n_unique().alias("num_relation_type"))
             .rename({"src.id": "mapped_id"})
         )
 
-    def filter_candidates_by_hierarchy(self, candidate_list):
+    def __filter_candidates_by_hierarchy(self, candidate_list):
         """
         Remove parent candidates if any reachable child candidate is also present.
 
@@ -67,42 +64,42 @@ class GraphTokenizer:
 
         return [c for c in candidate_list if c not in to_remove]
 
-    def check_eval_mapping_level(self, exact_mapped, non_exact):
+    def __check_eval_mapping_level(self, exact_mapped, non_exact):
         exact_set = set(exact_mapped)
         non_exact_set = set(non_exact)
 
         assert exact_set.isdisjoint(non_exact_set)
         assert len(self.mapped_id_list) == len(exact_set) + len(non_exact_set)
 
-    def eval_mapping_exact(self, candidate_set, debug=False):
+    def __eval_mapping_exact(self, candidate_set, debug=True):
         exact_mapped = list(self.mapped_id_set & candidate_set & self.exact_candidate_set)
         non_exact_mapped = list(self.mapped_id_set - set(exact_mapped))
 
         if debug:
-            self.check_eval_mapping_level(exact_mapped, non_exact_mapped)
+            self.__check_eval_mapping_level(exact_mapped, non_exact_mapped)
 
         return exact_mapped, non_exact_mapped
 
-    def eval_coverage_n_score(
+    def __eval_coverage_n_score(
         self,
         exact_mapped,
         non_exact_mapped,
         selected_edges,
-        debug=False,
+        debug=True,
     ):
         sem_cov_non_exact = self.sem_cov_base.filter(
             pl.col("mapped_id").is_in(non_exact_mapped),
         )
 
         sem_cov_non_exact_real = (
-            selected_edges.filter(pl.col("src.id").is_in(non_exact_mapped)).group_by("src.id").agg(pl.col("relation").n_unique().alias("real_num_sem_type")).rename({"src.id": "mapped_id"})
+            selected_edges.filter(pl.col("src.id").is_in(non_exact_mapped)).group_by("src.id").agg(pl.col("relation").n_unique().alias("real_num_relation_type")).rename({"src.id": "mapped_id"})
         )
 
         sem_cov_non_exact_score = (
             sem_cov_non_exact.join(sem_cov_non_exact_real, on="mapped_id", how="left")
             .fill_null(0.0)
             .with_columns(
-                frac_sem_cov=pl.col("real_num_sem_type") / pl.col("num_sem_type"),
+                frac_sem_cov=pl.col("real_num_relation_type") / pl.col("num_relation_type"),
             )
             .select("mapped_id", "frac_sem_cov")
         )
@@ -119,14 +116,14 @@ class GraphTokenizer:
         sem_cov_score = sem_cov["frac_sem_cov"].mean()
 
         if debug:
-            self.check_eval_mapping_level(
+            self.__check_eval_mapping_level(
                 sem_cov_exact_score["mapped_id"].unique(),
                 sem_cov_non_exact_score["mapped_id"].unique(),
             )
 
         return sem_cov, sem_cov_score
 
-    def get_tokenizer(self, exact_mapped, sem_cov, selected_edges, debug=False):
+    def get_tokenizer(self, exact_mapped, sem_cov, selected_edges, debug=True):
         df_tok_exact = self.exact_edges.filter(
             pl.col("mapped_id").is_in(exact_mapped),
         )
@@ -174,7 +171,7 @@ class GraphTokenizer:
         else:
             multi_candidates_filtered = multi_candidates.with_columns(
                 filtered_dst=pl.col("dst.id").map_elements(
-                    self.filter_candidates_by_hierarchy,
+                    self.__filter_candidates_by_hierarchy,
                     return_dtype=pl.List(pl.Utf8),
                 ),
             )
@@ -208,10 +205,13 @@ class GraphTokenizer:
 
         return df_tok_all
 
-    def get_distance_n_score(self, df_tok_all):
+    def __get_distance_n_score(self, df_tok_all):
         df_dist_mapped_candidate = df_tok_all.group_by("mapped_id").agg(pl.col("distance").mean())
 
-        mean_distance = df_dist_mapped_candidate["distance"].mean()
+        # UNK concepts have a null distance here; treat them as worst-case (max_dist_candidate + 1)
+        # instead of letting the mean silently skip them.
+        penalty_distance = self.max_dist_candidate + 1
+        mean_distance = df_dist_mapped_candidate["distance"].fill_null(penalty_distance).mean()
 
         if mean_distance is None or math.isnan(mean_distance):
             distance_score = 0.0
@@ -220,7 +220,7 @@ class GraphTokenizer:
 
         return df_dist_mapped_candidate, distance_score
 
-    def get_uniquness_n_entropy_score(self, df_tok_all_n_dist):
+    def __get_uniquness_n_entropy_score(self, df_tok_all_n_dist):
         total_concepts = len(self.mapped_id_list)
 
         redundancy_tok = (
@@ -250,8 +250,10 @@ class GraphTokenizer:
 
         return redundancy_tok, uniqueness_score
 
-    def get_conciseness_n_score(self, df_tok_all_n_dist):
-        df_tokens_per_concept = df_tok_all_n_dist.filter(pl.col("candidate_id") != "UNK").group_by("mapped_id").agg(pl.col("candidate_id").n_unique().alias("num_tokens"))
+    def __get_conciseness_n_score(self, df_tok_all_n_dist):
+        # UNK still expands to exactly one token (the UNK placeholder itself), so it's
+        # included here: this score reflects sequence expansion, not mapping quality.
+        df_tokens_per_concept = df_tok_all_n_dist.group_by("mapped_id").agg(pl.col("candidate_id").n_unique().alias("num_tokens"))
 
         if df_tokens_per_concept.height == 0:
             return df_tokens_per_concept, 0.0
@@ -261,19 +263,19 @@ class GraphTokenizer:
 
         return df_tokens_per_concept, conciseness_score
 
-    def evaluate_components_and_tokenize(self, candidate_list, debug=False):
+    def evaluate_components_and_tokenize(self, candidate_list, debug=True):
         candidate_set = set(candidate_list)
 
         selected_edges = self.edges_within_max.filter(
             pl.col("dst.id").is_in(candidate_set),
         )
 
-        exact_mapped, non_exact_mapped = self.eval_mapping_exact(
+        exact_mapped, non_exact_mapped = self.__eval_mapping_exact(
             candidate_set,
             debug=debug,
         )
 
-        sem_cov, sem_cov_score = self.eval_coverage_n_score(
+        sem_cov, sem_cov_score = self.__eval_coverage_n_score(
             exact_mapped,
             non_exact_mapped,
             selected_edges,
@@ -287,20 +289,19 @@ class GraphTokenizer:
             debug=debug,
         )
 
-        df_dist_mapped_candidate, distance_score = self.get_distance_n_score(
+        df_dist_mapped_candidate, distance_score = self.__get_distance_n_score(
             df_tok_all_n_dist,
         )
-        redundancy_tok, uniqueness_entropy_score = self.get_uniquness_n_entropy_score(
+        redundancy_tok, uniqueness_entropy_score = self.__get_uniquness_n_entropy_score(
             df_tok_all_n_dist,
         )
-        df_tokens_per_concept, conciseness_score = self.get_conciseness_n_score(
+        df_tokens_per_concept, conciseness_score = self.__get_conciseness_n_score(
             df_tok_all_n_dist,
         )
 
         compression_rate = len(candidate_set) / len(self.mapped_id_list)
         unk_rate = len(df_tok_all_n_dist.filter(pl.col("candidate_id") == "UNK")) / len(self.mapped_id_list)
         exact_rate = len(exact_mapped) / len(self.mapped_id_list)
-        uniqueness_rate = df_tok_all_n_dist.filter(pl.col("candidate_id") != "UNK")["mapped_id"].n_unique() / len(self.mapped_id_list)
 
         scores = {
             "sem_cov_score": sem_cov_score,
@@ -310,7 +311,6 @@ class GraphTokenizer:
             "compression_rate": compression_rate,
             "UNK_rate": unk_rate,
             "exact_rate": exact_rate,
-            "uniqueness_rate": uniqueness_rate,
         }
 
         results = {

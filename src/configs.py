@@ -18,3 +18,6 @@ class ProcessedGraph:
     candidate_is_a_reachable_dict: str = f"{path}candidate_is_a_reachable_dict.pkl"
     mapped_candidate_rel_dist_prop: str = f"{path}mapped_candidate_rel_dist_prop.parquet"
     concept_w_depth: str = f"{path}concept_w_depth.parquet"
+
+class TokenizerParam:
+    max_dist_candidate:int = 3
