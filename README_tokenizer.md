@@ -24,6 +24,7 @@ the closest candidate(s) that best represent it.
    - a self-loop for every mapped concept (`distance = 0`),
    - relations propagated outward from each mapped concept's neighbors via BFS on the
      IS_A graph (`distance = BFS distance + 1`).
+   - `Relation`: type inferred from the hop-1 direct neighbor (e.g. IS_A, FINDING_SITE) — literal only at distance == 1; candidates beyond that are the ancestor concepts on the IS_A path from that direct neighbor up to the SNOMED root, not literally connected to src.id by relation.
 
 4. **Precompute hierarchy reachability.** `precompute_candidate_reachable_child_map(g_is_a, candidate_ids)`
    builds `dict[candidate_id, set[descendant_candidate_ids]]` — for every candidate
@@ -163,11 +164,10 @@ exact_rate = count(concepts that are exact self-matches) / len(mapped_concepts)
 ## Notes / known interactions between scores
 
 - `sem_cov_score` and `distance_score` are corrected for `UNK` (a high UNK rate actively
-  lowers both). `uniqueness_entropy_score` and `conciseness_score` are not "quality"
+  lowers both). 
+- `uniqueness_entropy_score` and `conciseness_score` are not "quality"
   scores in that sense — `conciseness_score` by design measures expansion regardless of
-  quality, and `uniqueness_entropy_score` currently treats all-`UNK` concepts as one
+  quality
+- `uniqueness_entropy_score` currently treats all-`UNK` concepts as one
   shared group rather than excluding them.
-- `candidate_reachable_child_map` is required for hierarchy-based pruning of redundant
-  parent candidates in multi-candidate groups; if it's `None`, that pruning step is
-  skipped (a warning is printed) and multi-candidate groups keep every reachable
-  candidate as-is.
+

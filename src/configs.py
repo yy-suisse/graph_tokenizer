@@ -21,3 +21,7 @@ class ProcessedGraph:
 
 class TokenizerParam:
     max_dist_candidate:int = 3
+
+class IterativeGraphRed:
+    path: str = "D:/tokenizer_graph/graph_red_candidates/"
+    
