@@ -24,4 +24,13 @@ class TokenizerParam:
 
 class IterativeGraphRed:
     path: str = "D:/tokenizer_graph/graph_red_candidates/"
+
+class IterativeMarginalGain:
+    path: str = "D:/tokenizer_graph/margin_gain_candidates/"
+
+class Baselines:
+    path: str = "D:/tokenizer_graph/baselines_candidates/"
+
+
+
     
