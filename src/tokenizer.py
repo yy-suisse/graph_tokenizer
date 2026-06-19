@@ -302,7 +302,7 @@ class GraphTokenizer:
         compression_rate = df_tok_all_n_dist["candidate_id"].n_unique() / len(self.mapped_id_list)
         unk_rate = len(df_tok_all_n_dist.filter(pl.col("candidate_id") == "UNK")) / len(self.mapped_id_list)
         exact_rate = len(exact_mapped) / len(self.mapped_id_list)
-
+        
         scores = {
             "sem_cov_score": sem_cov_score,
             "distance_score": distance_score,
