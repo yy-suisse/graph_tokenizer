@@ -32,5 +32,7 @@ class Baselines:
     path: str = "D:/tokenizer_graph/baselines_candidates/"
 
 
+class Results:
+    path: str = "D:/tokenizer_graph/results/"
 
     
