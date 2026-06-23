@@ -143,11 +143,12 @@ is included in this average like any other concept, contributing `num_tokens = 1
 ### `compression_rate`
 
 ```
-compression_rate = len(candidate_list) / len(mapped_concepts)
+compression_rate = n_unique(assigned_candidate_ids) / len(mapped_concepts)
 ```
 
-Vocabulary size relative to the number of concepts being tokenized — smaller means more
-compression.
+`assigned_candidate_ids` is the set of distinct candidate IDs that appear in the final
+tokenization (including `"UNK"` if any concept is unmapped, but excluding candidates from
+`candidate_list` that were never assigned to any concept). Smaller means more compression.
 
 ### `UNK_rate`
 
