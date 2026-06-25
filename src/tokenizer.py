@@ -299,7 +299,8 @@ class GraphTokenizer:
             df_tok_all_n_dist,
         )
 
-        compression_rate = df_tok_all_n_dist["candidate_id"].n_unique() / len(self.mapped_id_list)
+        num_candidates = df_tok_all_n_dist["candidate_id"].n_unique()
+        compression_rate = num_candidates / len(self.mapped_id_list)
         unk_rate = len(df_tok_all_n_dist.filter(pl.col("candidate_id") == "UNK")) / len(self.mapped_id_list)
         exact_rate = len(exact_mapped) / len(self.mapped_id_list)
         
@@ -311,6 +312,7 @@ class GraphTokenizer:
             "compression_rate": compression_rate,
             "UNK_rate": unk_rate,
             "exact_rate": exact_rate,
+            "num_candidates": num_candidates
         }
 
         results = {

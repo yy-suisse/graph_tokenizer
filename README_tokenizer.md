@@ -140,10 +140,21 @@ conciseness_score = 1 / mean(num_tokens over all mapped concepts)
 A `UNK` concept still expands to exactly one token (the `UNK` placeholder itself), so it
 is included in this average like any other concept, contributing `num_tokens = 1`.
 
+### `num_candidates`
+
+```
+num_candidates = n_unique(assigned_candidate_ids)
+```
+
+The actual number of distinct candidates used in the tokenization — i.e. candidates from
+`candidate_list` that were assigned to at least one concept. This differs from the nominal
+`k` when methods don't account for redundancy (hierarchy pruning, etc.), so
+`num_candidates` is the correct x-axis for comparing methods across vocabulary sizes.
+
 ### `compression_rate`
 
 ```
-compression_rate = n_unique(assigned_candidate_ids) / len(mapped_concepts)
+compression_rate = num_candidates / len(mapped_concepts)
 ```
 
 `assigned_candidate_ids` is the set of distinct candidate IDs that appear in the final
@@ -165,10 +176,20 @@ exact_rate = count(concepts that are exact self-matches) / len(mapped_concepts)
 ## Notes / known interactions between scores
 
 - `sem_cov_score` and `distance_score` are corrected for `UNK` (a high UNK rate actively
-  lowers both). 
+  lowers both).
 - `uniqueness_entropy_score` and `conciseness_score` are not "quality"
   scores in that sense — `conciseness_score` by design measures expansion regardless of
-  quality
+  quality.
 - `uniqueness_entropy_score` currently treats all-`UNK` concepts as one
   shared group rather than excluding them.
+- **`final_score`** (computed in the app, not stored in the parquet) =
+  `distance_score × uniqueness_entropy_score × sem_cov_score`. A multiplicative joint
+  score: any dimension near zero collapses the whole score, which is intentional —
+  a method that fails on coverage should not rank well even if distance and entropy
+  are high. All three factors are in [0, 1] so `final_score` is also in [0, 1].
+- **`k` vs `num_candidates`**: `k` is the requested vocabulary size passed to
+  `evaluate_components_and_tokenize`; `num_candidates` is the actual number of distinct
+  candidates that appear in the tokenization output. These differ when candidates are
+  pruned by hierarchy or when no mapped concept reaches a given candidate. Use
+  `num_candidates` for fair cross-method comparisons.
 

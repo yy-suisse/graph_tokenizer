@@ -76,13 +76,20 @@ further candidates with diminishing returns past this point. Stored at
 
 Every method is evaluated at `k = 500, 1000, ..., 11500` (23 points) via
 `tokenizer.evaluate_components_and_tokenize(candidate_ids[:k])` — i.e. all methods are
-compared on equal footing at the *same* k values, even though the two graph-reduction-style
-methods naturally produce more candidates than `k=11500` if left to run to completion.
+compared on equal footing at the *same nominal k values*, even though the two
+graph-reduction-style methods naturally produce more candidates than `k=11500` if left to
+run to completion.
+
+> **Important:** `k` is the *requested* vocabulary size, not the *actual* number of
+> candidates used. Methods that don't account for redundancy (e.g. hierarchy pruning)
+> may assign fewer unique candidates than k. All charts and comparisons in the app use
+> `num_candidates` (the actual unique assigned candidates) on the x-axis, not k.
 
 Scores (full definitions in [README_tokenizer.md](README_tokenizer.md#scores)):
 
 | Score | Direction | One-line meaning |
 |---|---|---|
+| `final_score` | higher better | **combined score** = `distance_score × uniqueness_entropy_score × sem_cov_score` — joint reward for closeness, diversity, and semantic coverage |
 | `sem_cov_score` | higher better | mean fraction of each concept's relation types covered by the vocabulary |
 | `distance_score` | higher better | how close (in hops) assigned tokens are to the concept they represent |
 | `uniqueness_entropy_score` | higher = more diverse | how evenly distinct the token assignments are across concepts |
@@ -91,11 +98,14 @@ Scores (full definitions in [README_tokenizer.md](README_tokenizer.md#scores)):
 | `UNK_rate` | lower better | fraction of concepts that got no coverage at all |
 | `exact_rate` | higher = less abstraction | fraction of concepts that are exact self-matches |
 
-Results are written to `results/scores.parquet` (`method`, `k`, + the 7 scores above).
+Results are written to `results/scores.parquet` (`method`, `k`, `num_candidates`, + the 7 scores above).
+`final_score` is computed on the fly from the three component scores.
 
 ## Results
 
-Leaderboard (top-3 methods) at three representative k values:
+Leaderboard (top-3 methods) at three representative nominal k values.
+Note that actual `num_candidates` may differ per method at the same k (see note above).
+For a combined ranking, see `final_score` = `distance_score × uniqueness_entropy_score × sem_cov_score` in the app.
 
 **`sem_cov_score`**
 
