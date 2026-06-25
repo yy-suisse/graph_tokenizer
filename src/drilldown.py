@@ -87,6 +87,34 @@ def tokenize_for(tokenizer: GraphTokenizer, method: str, k: int):
     return tokenizer.evaluate_components_and_tokenize(candidate_ids, debug=False)
 
 
+def get_all_concept_scores(results: dict) -> pl.DataFrame:
+    """Build a per-concept score table from the `results` dict returned by
+    GraphTokenizer.evaluate_components_and_tokenize.
+
+    Columns: mapped_id, frac_sem_cov, mean_distance, num_tokens, redundancy_group_size.
+    """
+    sem_cov = results["sem_cov"].select("mapped_id", "frac_sem_cov")
+
+    dist = results["df_dist_mapped_candidate"].rename({"distance": "mean_distance"})
+
+    tokens = results["df_tokens_per_concept"]
+
+    # Explode the redundancy groups to get group_size per mapped concept.
+    group_sizes = (
+        results["redundancy_tok"]
+        .select("mapped_id_w_same_candidate", "num_mapped_w_same_candidate")
+        .explode("mapped_id_w_same_candidate")
+        .rename({"mapped_id_w_same_candidate": "mapped_id", "num_mapped_w_same_candidate": "redundancy_group_size"})
+    )
+
+    return (
+        sem_cov
+        .join(dist, on="mapped_id", how="left")
+        .join(tokens, on="mapped_id", how="left")
+        .join(group_sizes, on="mapped_id", how="left")
+    )
+
+
 def get_concept_scores(results: dict, mapped_id: str) -> dict:
     """Per-concept breakdown of the components behind the method-level scores, for one
     mapped concept, pulled out of the `results` dict returned alongside `scores` by

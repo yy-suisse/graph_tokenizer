@@ -80,8 +80,8 @@ filtered = df.filter(
     & (pl.col("k") <= k_range[1])
 )
 
-tab_compare, tab_leaderboard, tab_table, tab_drilldown = st.tabs(
-    ["Compare scores", "Leaderboard at k", "Raw table", "Concept drill-down"],
+tab_compare, tab_leaderboard, tab_table, tab_dist, tab_drilldown = st.tabs(
+    ["Compare scores", "Leaderboard at k", "Raw table", "Score distributions", "Concept drill-down"],
 )
 
 with tab_compare:
@@ -135,6 +135,83 @@ with tab_table:
         file_name="filtered_scores.csv",
         mime="text/csv",
     )
+
+with tab_dist:
+    st.subheader("Per-concept score distributions")
+    st.caption(
+        "Choose a method and k to see how individual scores are spread across all 46 k mapped concepts "
+        "— revealing whether good aggregate scores hide a long tail of poorly-covered concepts.",
+    )
+
+    col_dm, col_dk = st.columns(2)
+    with col_dm:
+        dist_method = st.selectbox("Method", methods, key="dist_method")
+    with col_dk:
+        dist_k = st.select_slider("k", options=k_values, key="dist_k")
+
+    _dist_scores, dist_results, _dist_tok = cached_tokenize_for(dist_method, dist_k)
+    concept_df = drilldown.get_all_concept_scores(dist_results).to_pandas()
+
+    # --- aggregate KPI summary ---
+    method_row = df.filter((pl.col("method") == dist_method) & (pl.col("k") == dist_k))
+    st.markdown("**Method-level aggregate scores at this k**")
+    agg_cols = st.columns(len(SCORE_COLS))
+    for col, name in zip(agg_cols, SCORE_COLS):
+        val = method_row[name][0] if method_row.height else None
+        col.metric(name.replace("_", " "), f"{val:.3f}" if val is not None else "—")
+
+    st.divider()
+
+    # --- distributions ---
+    DIST_SPECS = [
+        ("frac_sem_cov",          "Semantic coverage per concept",   "Fraction of relation types covered (1.0 = full coverage, 0.0 = UNK)",    True),
+        ("mean_distance",         "Mean token distance per concept",  "Average hop distance to assigned candidate(s); UNK concepts excluded",   False),
+        ("num_tokens",            "Number of tokens per concept",     "How many distinct candidates a concept expands into",                     False),
+        ("redundancy_group_size", "Redundancy group size",            "How many concepts share the exact same set of assigned candidates",       False),
+    ]
+
+    for col_a, col_b in zip(DIST_SPECS[::2], DIST_SPECS[1::2]):
+        left, right = st.columns(2)
+        for pane, (col_name, title, x_label, show_unk_note) in zip([left, right], [col_a, col_b]):
+            with pane:
+                plot_df = concept_df[["mapped_id", col_name]].dropna()
+                fig = px.histogram(
+                    plot_df,
+                    x=col_name,
+                    nbins=40,
+                    title=title,
+                    labels={col_name: x_label},
+                    color_discrete_sequence=["#4a90d9"],
+                )
+                fig.update_layout(height=340, bargap=0.05, showlegend=False,
+                                  margin={"t": 40, "b": 10})
+                st.plotly_chart(fig, use_container_width=True)
+                unk_n = (concept_df["frac_sem_cov"] == 0.0).sum()
+                if show_unk_note and unk_n > 0:
+                    st.caption(f"{unk_n} UNK concept(s) (frac_sem_cov = 0) included at the left edge.")
+                null_n = concept_df[col_name].isna().sum()
+                if null_n > 0:
+                    st.caption(f"{null_n} concept(s) with no value for this metric are excluded.")
+
+    st.divider()
+    st.markdown("**Joint distribution: semantic coverage vs mean distance**")
+    joint_df = concept_df[["frac_sem_cov", "mean_distance", "num_tokens"]].dropna()
+    fig_joint = px.scatter(
+        joint_df,
+        x="mean_distance",
+        y="frac_sem_cov",
+        color="num_tokens",
+        color_continuous_scale="Viridis",
+        labels={
+            "mean_distance": "Mean token distance",
+            "frac_sem_cov": "Semantic coverage",
+            "num_tokens": "# tokens",
+        },
+        opacity=0.4,
+    )
+    fig_joint.update_traces(marker_size=4)
+    fig_joint.update_layout(height=420)
+    st.plotly_chart(fig_joint, use_container_width=True)
 
 with tab_drilldown:
     st.subheader("How is a single concept tokenized?")
