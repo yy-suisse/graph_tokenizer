@@ -8,12 +8,18 @@ class GraphTokenizer:
         self,
         concept_connected_subgraph: pl.DataFrame,
         concept_candidate_dist_n_rel: pl.DataFrame,
+        df_relation: pl.DataFrame,
         candidate_reachable_child_map: dict | None = None,
         max_dist_candidate: int = 10000,
+        
     ):
         self.max_dist_candidate = max_dist_candidate
 
-        self.mapped_id_list = concept_connected_subgraph.filter(pl.col("is_mapped"))["id"].to_list()
+        self.mapped_id_list = (
+            concept_connected_subgraph.filter(pl.col("is_mapped"))["id"]
+            .unique()
+            .to_list()
+        )
         self.mapped_id_set = set(self.mapped_id_list)
 
         self.candidate_concepts = concept_candidate_dist_n_rel["dst.id"].unique().to_list()
@@ -37,8 +43,7 @@ class GraphTokenizer:
 
         # Baseline semantic type count per mapped concept, independent of candidate list.
         self.sem_cov_base = (
-            concept_candidate_dist_n_rel.filter(pl.col("src.id").is_in(self.mapped_id_list))
-            .filter(pl.col("distance") == 1)
+            df_relation.filter(pl.col("src.id").is_in(self.mapped_id_list))
             .group_by("src.id")
             .agg(pl.col("relation").n_unique().alias("num_relation_type"))
             .rename({"src.id": "mapped_id"})
@@ -69,7 +74,7 @@ class GraphTokenizer:
         non_exact_set = set(non_exact)
 
         assert exact_set.isdisjoint(non_exact_set)
-        assert len(self.mapped_id_list) == len(exact_set) + len(non_exact_set)
+        assert len(self.mapped_id_set) == len(exact_set) + len(non_exact_set)
 
     def __eval_mapping_exact(self, candidate_set, debug=True):
         exact_mapped = list(self.mapped_id_set & candidate_set & self.exact_candidate_set)
@@ -87,19 +92,26 @@ class GraphTokenizer:
         selected_edges,
         debug=True,
     ):
-        sem_cov_non_exact = self.sem_cov_base.filter(
-            pl.col("mapped_id").is_in(non_exact_mapped),
+        sem_cov_non_exact = (
+            pl.DataFrame({"mapped_id": non_exact_mapped})
+            .join(self.sem_cov_base, on="mapped_id", how="left")
+            .with_columns(pl.col("num_relation_type").fill_null(0))
         )
 
         sem_cov_non_exact_real = (
-            selected_edges.filter(pl.col("src.id").is_in(non_exact_mapped)).group_by("src.id").agg(pl.col("relation").n_unique().alias("real_num_relation_type")).rename({"src.id": "mapped_id"})
+            selected_edges.filter(pl.col("src.id").is_in(non_exact_mapped))
+            .group_by("src.id")
+            .agg(pl.col("relation").n_unique().alias("real_num_relation_type"))
+            .rename({"src.id": "mapped_id"})
         )
 
         sem_cov_non_exact_score = (
             sem_cov_non_exact.join(sem_cov_non_exact_real, on="mapped_id", how="left")
             .fill_null(0.0)
             .with_columns(
-                frac_sem_cov=pl.col("real_num_relation_type") / pl.col("num_relation_type"),
+                frac_sem_cov=pl.when(pl.col("num_relation_type") == 0)
+                .then(0.0)
+                .otherwise(pl.col("real_num_relation_type") / pl.col("num_relation_type")),
             )
             .select("mapped_id", "frac_sem_cov")
         )

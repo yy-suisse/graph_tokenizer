@@ -3,7 +3,8 @@ import pickle
 import networkx as nx
 import polars as pl
 
-from src import configs, graph_fct
+from . import configs_mapped
+from src import graph_fct
 from src.tokenizer import GraphTokenizer
 
 GR_FILE_BY_METHOD = {
@@ -15,17 +16,17 @@ GR_FILE_BY_METHOD = {
 
 
 def load_concepts() -> pl.DataFrame:
-    return pl.read_parquet(configs.ProcessedGraph.concept_w_depth)
+    return pl.read_parquet(configs_mapped.ProcessedGraph.concept_w_depth)
 
 
 def load_relations() -> pl.DataFrame:
-    return pl.read_parquet(configs.ProcessedGraph().mapped_candidate_rel_dist_prop).filter(
-        pl.col("distance") <= configs.TokenizerParam().max_dist_candidate,
+    return pl.read_parquet(configs_mapped.ProcessedGraph().mapped_candidate_rel_dist_prop).filter(
+        pl.col("distance") <= configs_mapped.TokenizerParam().max_dist_candidate,
     )
 
 
 def load_candidate_reachable_child_map() -> dict:
-    with open(configs.ProcessedGraph().candidate_is_a_reachable_dict, "rb") as f:
+    with open(configs_mapped.ProcessedGraph().candidate_is_a_reachable_dict, "rb") as f:
         return pickle.load(f)
 
 
@@ -33,7 +34,7 @@ def load_is_a_graph() -> nx.DiGraph:
     """Full SNOMED IS_A graph (child -> parent), used to walk the path between a
     mapped concept's direct neighbor and a candidate sitting further up the hierarchy.
     """
-    df_relation = pl.read_parquet(configs.GraphConfig().relation_path)
+    df_relation = pl.read_parquet(configs_mapped.GraphConfig().relation_path)
     return graph_fct.get_is_a_graph(df_relation)
 
 
@@ -42,14 +43,14 @@ def build_tokenizer(concepts: pl.DataFrame, relations: pl.DataFrame, candidate_r
         concepts,
         relations,
         candidate_reachable_child_map,
-        configs.TokenizerParam().max_dist_candidate,
+        configs_mapped.TokenizerParam().max_dist_candidate,
     )
 
 
 def get_candidate_ids(method: str, k: int) -> list[str]:
-    baselines_path = configs.Baselines().path
-    gr_path = configs.IterativeGraphRed().path
-    mg_path = configs.IterativeMarginalGain().path
+    baselines_path = configs_mapped.Baselines().path
+    gr_path = configs_mapped.IterativeGraphRed().path
+    mg_path = configs_mapped.IterativeMarginalGain().path
 
     if method == "b_random_k":
         df = pl.read_parquet(f"{baselines_path}k_random_all_samples.parquet")

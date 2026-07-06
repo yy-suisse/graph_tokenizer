@@ -3,14 +3,15 @@ import plotly.express as px
 import streamlit as st
 import streamlit.components.v1 as components
 
-from src import configs, drilldown, graph_viz
+from . import configs_mapped
+from src import drilldown, graph_viz
 
 st.set_page_config(page_title="Graph Tokenizer — Candidate Selection Comparison", layout="wide")
 
 
 @st.cache_data
 def load_scores() -> pl.DataFrame:
-    return pl.read_parquet(f"{configs.Results().path}scores.parquet")
+    return pl.read_parquet(f"{configs_mapped.Results().path}scores.parquet")
 
 
 @st.cache_resource
@@ -397,6 +398,6 @@ with tab_drilldown:
             direct_neighbors,
             used_candidates,
             id_to_label,
-            max_dist=configs.TokenizerParam().max_dist_candidate,
+            max_dist=configs_mapped.TokenizerParam().max_dist_candidate,
         )
         components.html(html, height=780, scrolling=True)

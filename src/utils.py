@@ -52,7 +52,7 @@ class ConceptPropagate:
         df_concept_w_depth_idx = df_concept_w_depth.join(df_concept2idx, on="id", how="left").select(["concept_idx", "is_mapped", "max_depth"])
 
         # mapped idx (Series) for quick use later
-        mapped_idx = df_concept_w_depth_idx.filter(pl.col("is_mapped") == True).get_column("concept_idx")
+        mapped_idx = df_concept_w_depth_idx.filter(pl.col("is_mapped") == True).get_column("concept_idx").to_list()
 
         # ---- 2) build relation table with indices (avoid to_series/is_in) ----
         # Keep only relations whose src is in concept set by inner join on src.id
@@ -147,13 +147,13 @@ class ConceptPropagate:
 
     def build_all_distance_and_relations(self):
         rel_original = self.__build_original_relations_with_dist__()
-        rel_self = self.__build_self_relations__()
-        rel_propagated = self.__build_mapped_to_all_candidate_relations__().cast(rel_original.schema)  # ensure same schema for concat
+        rel_self = self.__build_self_relations__().cast(rel_original.schema)
+        rel_propagated = self.__build_mapped_to_all_candidate_relations__().cast(rel_original.schema)
         rel_all = (pl.concat([rel_original, rel_self, rel_propagated], how="vertical")
                    .unique()
                    .filter(pl.col("src_idx").is_in(self.mapped_idx)) # get the subgraph formed by mapped concepts reachable to ROOT.
                    )
-        
+
         return self.__idx2id_concept__(rel_all)
 
 
