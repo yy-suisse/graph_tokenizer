@@ -19,20 +19,23 @@ def _label(concept_id: str, id_to_label: dict) -> str:
 def build_concept_graph_html(
     concept_id: str,
     is_a_graph: nx.DiGraph,
-    direct_neighbors: pl.DataFrame,
+    neighbors: pl.DataFrame,
     used_candidates: pl.DataFrame,
     id_to_label: dict,
-    max_dist: int = 3,
     max_nodes: int = 200,
     height: str = "780px",
 ) -> str:
     """
-    Shows every concept reachable from concept_id within max_dist hops, not just the
-    ones selected as candidates: the direct (distance-1) neighbors, plus every
-    intermediate IS_A ancestor on the path up to a further-away candidate, so the chain
-    mapped -> intermediate -> candidate is visible instead of a direct shortcut edge.
+    Shows every concept reachable from concept_id within max_dist_candidate hops, not
+    just the ones selected as candidates — and draws the real hop-by-hop connectivity
+    (mapped concept -> distance-1 neighbor -> IS_A ancestor -> ... -> destination)
+    instead of a direct shortcut edge, so every intermediate concept on the path is
+    visible.
 
-    direct_neighbors: columns dst.id, relation (distance == 1 neighbors of concept_id).
+    neighbors: columns dst.id, relation, distance — every neighbor of concept_id up to
+        max_dist_candidate hops (the same table the tokenizer draws candidates from).
+        distance == 1 rows are direct neighbors (any relation type); distance > 1 rows
+        are reached from a distance-1 neighbor purely via IS_A hops.
     used_candidates: columns candidate_id, relation, distance (candidates the tokenizer
         actually assigned to concept_id, excluding "UNK").
     """
@@ -87,45 +90,80 @@ def build_concept_graph_html(
             return {"color": COLOR_CANDIDATE, "dashes": False, "width": 3}
         return {"color": COLOR_NOT_CANDIDATE, "dashes": True, "width": 2}
 
-    for row in direct_neighbors.iter_rows(named=True):
-        if len(added_nodes) >= max_nodes:
-            break
+    direct_rows = neighbors.filter(pl.col("distance") == 1)
+    further_rows = neighbors.filter(pl.col("distance") > 1)
 
+    direct_neighbor_by_relation: dict[str, list[str]] = {}
+    for row in direct_rows.iter_rows(named=True):
         neighbor = row["dst.id"]
         relation = row["relation"]
 
-        if neighbor == concept_id:
+        if neighbor == concept_id or len(added_nodes) >= max_nodes:
             continue
 
         style = node_style(neighbor)
         add_node(neighbor, label=_label(neighbor, id_to_label), size=46, font=NODE_FONT, **style)
         add_edge(concept_id, neighbor, label=relation, font=EDGE_FONT, **edge_style(neighbor))
+        direct_neighbor_by_relation.setdefault(relation, []).append(neighbor)
 
-        # Walk up the IS_A graph (child -> parent edges) from this direct neighbor to
-        # surface every intermediate ancestor up to max_dist, regardless of whether it
-        # was selected as a candidate.
-        frontier = [neighbor]
-        visited_chain = {neighbor}
-        for _hop in range(1, max_dist):
-            next_frontier = []
-            for node in frontier:
-                if node not in is_a_graph:
-                    continue
-                for parent in is_a_graph.successors(node):
-                    if parent in visited_chain:
-                        continue
-                    visited_chain.add(parent)
-                    next_frontier.append(parent)
+    # For distance > 1, reconstruct the actual IS_A chain from the distance-1 neighbor
+    # (reached via the same relation) to the destination, so intermediate ancestors show
+    # up as real nodes instead of being hidden behind a shortcut edge.
+    max_extra_hops = int(further_rows["distance"].max()) - 1 if further_rows.height else 0
+    is_a_path_cache: dict[str, dict[str, list[str]]] = {}
 
-                    if len(added_nodes) >= max_nodes:
-                        continue
+    def is_a_paths_from(neighbor: str) -> dict[str, list[str]]:
+        if neighbor not in is_a_path_cache:
+            if neighbor in is_a_graph:
+                is_a_path_cache[neighbor] = nx.single_source_shortest_path(is_a_graph, neighbor, cutoff=max_extra_hops)
+            else:
+                is_a_path_cache[neighbor] = {}
+        return is_a_path_cache[neighbor]
 
-                    style = node_style(parent)
-                    add_node(parent, label=_label(parent, id_to_label), size=36, font=NODE_FONT, **style)
-                    add_edge(node, parent, label="IS_A", font=EDGE_FONT, **edge_style(parent))
+    for row in further_rows.iter_rows(named=True):
+        if len(added_nodes) >= max_nodes:
+            break
 
-            frontier = next_frontier
-            if not frontier or len(added_nodes) >= max_nodes:
+        dst = row["dst.id"]
+        relation = row["relation"]
+        distance = row["distance"]
+
+        if dst == concept_id or dst in added_nodes:
+            continue
+
+        # Prefer a chain starting from a same-relation distance-1 neighbor, but fall back
+        # to any distance-1 neighbor with a real IS_A path to dst — the exact hop count
+        # can differ slightly from the recorded distance because is_a_graph (built from
+        # the full, unfiltered connectivity table) can contain shortcut IS_A edges that
+        # weren't present in the smaller graph used to precompute distances.
+        chain = None
+        for neighbor in direct_neighbor_by_relation.get(relation, []):
+            chain = is_a_paths_from(neighbor).get(dst)
+            if chain:
                 break
+
+        if chain is None:
+            for neighbor_list in direct_neighbor_by_relation.values():
+                for neighbor in neighbor_list:
+                    chain = is_a_paths_from(neighbor).get(dst)
+                    if chain:
+                        break
+                if chain:
+                    break
+
+        if chain is None:
+            # No reconstructable IS_A path at all (fully disconnected in is_a_graph) —
+            # still show the concept rather than silently dropping it.
+            style = node_style(dst)
+            add_node(dst, label=_label(dst, id_to_label), size=36, font=NODE_FONT, **style)
+            add_edge(concept_id, dst, label=f"{relation} (d={int(distance)})", font=EDGE_FONT, **edge_style(dst))
+            continue
+
+        prev = chain[0]
+        for node in chain[1:]:
+            style = node_style(node)
+            add_node(node, label=_label(node, id_to_label), size=36, font=NODE_FONT, **style)
+            add_edge(prev, node, label="IS_A", font=EDGE_FONT, **edge_style(node))
+            prev = node
 
     return net.generate_html(notebook=False)

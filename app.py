@@ -3,43 +3,47 @@ import plotly.express as px
 import streamlit as st
 import streamlit.components.v1 as components
 
-from . import configs_mapped
-from src import drilldown, graph_viz
+from src import configs_fd, configs_mapped, drilldown, graph_viz
 
 st.set_page_config(page_title="Graph Tokenizer — Candidate Selection Comparison", layout="wide")
 
+CONFIGS = {"mapped": configs_mapped, "fd": configs_fd}
+CONCEPT_SET_LABELS = {"mapped": "Mapped concepts", "fd": "Fully defined concepts"}
+
 
 @st.cache_data
-def load_scores() -> pl.DataFrame:
-    return pl.read_parquet(f"{configs_mapped.Results().path}scores.parquet")
+def load_scores(concept_set: str) -> pl.DataFrame:
+    config = CONFIGS[concept_set]
+    return pl.read_parquet(f"{config.Results().path}scores.parquet")
 
 
 @st.cache_resource
-def load_tokenizer():
-    concepts = drilldown.load_concepts()
-    relations = drilldown.load_relations()
-    candidate_reachable_child_map = drilldown.load_candidate_reachable_child_map()
-    tokenizer = drilldown.build_tokenizer(concepts, relations, candidate_reachable_child_map)
+def load_tokenizer(concept_set: str):
+    concepts = drilldown.load_concepts(concept_set)
+    relations = drilldown.load_relations(concept_set)
+    df_relation = drilldown.load_df_relation(concept_set)
+    candidate_reachable_child_map = drilldown.load_candidate_reachable_child_map(concept_set)
+    tokenizer = drilldown.build_tokenizer(concepts, relations, df_relation, candidate_reachable_child_map, concept_set)
     id_to_label = dict(zip(concepts["id"].to_list(), concepts["label"].to_list()))
     return tokenizer, relations, id_to_label
 
 
 @st.cache_resource(show_spinner="Loading SNOMED IS_A graph...")
-def load_is_a_graph():
-    return drilldown.load_is_a_graph()
+def load_is_a_graph(concept_set: str):
+    return drilldown.load_is_a_graph(concept_set)
 
 
 @st.cache_data
-def load_mapped_concept_options(_concepts_dummy: int):
-    concepts = drilldown.load_concepts()
+def load_mapped_concept_options(concept_set: str):
+    concepts = drilldown.load_concepts(concept_set)
     mapped = concepts.filter(pl.col("is_mapped"))
     return mapped.select("id", "label").to_pandas()
 
 
 @st.cache_data(show_spinner="Tokenizing with this method/k...")
-def cached_tokenize_for(method: str, k: int):
-    tokenizer, _relations, _id_to_label = load_tokenizer()
-    scores, results, df_tok_all_n_dist = drilldown.tokenize_for(tokenizer, method, k)
+def cached_tokenize_for(concept_set: str, method: str, k: int):
+    tokenizer, _relations, _id_to_label = load_tokenizer(concept_set)
+    scores, results, df_tok_all_n_dist = drilldown.tokenize_for(tokenizer, concept_set, method, k)
     return scores, results, df_tok_all_n_dist
 
 
@@ -56,7 +60,15 @@ SCORE_COLS = [
 
 LOWER_IS_BETTER = {"compression_rate", "UNK_rate"}
 
-df = load_scores().with_columns(
+concept_set = st.sidebar.radio(
+    "Concept set",
+    options=list(CONCEPT_SET_LABELS),
+    format_func=lambda c: CONCEPT_SET_LABELS[c],
+    key="concept_set",
+)
+config = CONFIGS[concept_set]
+
+df = load_scores(concept_set).with_columns(
     final_score=(
         pl.col("distance_score") * pl.col("uniqueness_entropy_score") * pl.col("sem_cov_score")
     )
@@ -67,7 +79,7 @@ methods = sorted(df["method"].unique().to_list())
 
 st.title("Candidate Selection — Method Comparison")
 st.caption(
-    "Browse precomputed tokenizer scores for every candidate-selection method. "
+    f"Browse precomputed tokenizer scores for every candidate-selection method, on **{CONCEPT_SET_LABELS[concept_set]}**. "
     "Charts use **num_candidates** (actual unique assigned candidates) on the x-axis — "
     "not the nominal k — so methods are compared on equal footing regardless of redundancy."
 )
@@ -178,7 +190,7 @@ with tab_dist:
 
     method_row = dist_method_rows.filter(pl.col("num_candidates") == dist_nc)
     dist_k = int(method_row["k"][0])
-    _dist_scores, dist_results, _dist_tok = cached_tokenize_for(dist_method, dist_k)
+    _dist_scores, dist_results, _dist_tok = cached_tokenize_for(concept_set, dist_method, dist_k)
     concept_df = drilldown.get_all_concept_scores(dist_results).to_pandas()
     st.markdown("**Method-level aggregate scores at this k**")
     agg_cols = st.columns(len(SCORE_COLS))
@@ -304,7 +316,7 @@ with tab_drilldown:
             "50-draw average shown in the leaderboard — scores will differ slightly.",
         )
 
-    mapped_options = load_mapped_concept_options(0)
+    mapped_options = load_mapped_concept_options(concept_set)
 
     search = st.text_input("Search mapped concept by id or label", "")
     if search:
@@ -322,8 +334,8 @@ with tab_drilldown:
         picked = st.selectbox("Mapped concept", option_labels, key="dd_concept")
         picked_id = matches.iloc[option_labels.index(picked)]["id"]
 
-        scores, results, df_tok_all_n_dist = cached_tokenize_for(dd_method, dd_k)
-        _tokenizer, relations, id_to_label = load_tokenizer()
+        scores, results, df_tok_all_n_dist = cached_tokenize_for(concept_set, dd_method, dd_k)
+        _tokenizer, relations, id_to_label = load_tokenizer(concept_set)
 
         concept_rows = df_tok_all_n_dist.filter(pl.col("mapped_id") == picked_id)
 
@@ -379,25 +391,24 @@ with tab_drilldown:
         st.markdown("#### Graph view")
         st.caption(
             "Blue = the tokenized concept · Green = candidates actually used to tokenize it · "
-            "Red = UNK (no coverage) · Gray dashed = every other concept reachable on the way "
-            "there (direct neighbors and intermediate IS_A ancestors) that were "
-            "**not** selected as tokenizing candidates.",
+            "Red = UNK (no coverage) · Gray dashed = every other concept reachable within "
+            f"{config.TokenizerParam().max_dist_candidate} hops (via the real intermediate "
+            "IS_A chain) that were **not** selected as tokenizing candidates.",
         )
 
-        is_a_graph = load_is_a_graph()
+        is_a_graph = load_is_a_graph(concept_set)
 
-        direct_neighbors = relations.filter(
-            (pl.col("src.id") == picked_id) & (pl.col("distance") == 1),
-        ).select("dst.id", "relation")
+        neighbors = relations.filter(
+            pl.col("src.id") == picked_id,
+        ).select("dst.id", "relation", "distance")
 
         used_candidates = concept_rows.select("candidate_id", "relation", "distance")
 
         html = graph_viz.build_concept_graph_html(
             picked_id,
             is_a_graph,
-            direct_neighbors,
+            neighbors,
             used_candidates,
             id_to_label,
-            max_dist=configs_mapped.TokenizerParam().max_dist_candidate,
         )
         components.html(html, height=780, scrolling=True)

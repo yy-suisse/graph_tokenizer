@@ -3,54 +3,80 @@ import pickle
 import networkx as nx
 import polars as pl
 
-from . import configs_mapped
+from . import configs_fd, configs_mapped
 from src import graph_fct
 from src.tokenizer import GraphTokenizer
 
+CONFIGS = {
+    "mapped": configs_mapped,
+    "fd": configs_fd,
+}
+
 GR_FILE_BY_METHOD = {
-    "gr_sum_inv": " sum_inv.parquet",
-    "gr_sum_inv_exp": " sum_inv_exp.parquet",
-    "gr_tempered_sum_inv": " tempered_sum_inv.parquet",
-    "gr_tempered_sum_inv_exp": " tempered_sum_inv_exp.parquet",
+    "gr_sum_inv": "sum_inv.parquet",
+    "gr_sum_inv_exp": "sum_inv_exp.parquet",
+    "gr_tempered_sum_inv": "tempered_sum_inv.parquet",
+    "gr_tempered_sum_inv_exp": "tempered_sum_inv_exp.parquet",
 }
 
 
-def load_concepts() -> pl.DataFrame:
-    return pl.read_parquet(configs_mapped.ProcessedGraph.concept_w_depth)
+def get_config(config_name: str):
+    return CONFIGS[config_name]
 
 
-def load_relations() -> pl.DataFrame:
-    return pl.read_parquet(configs_mapped.ProcessedGraph().mapped_candidate_rel_dist_prop).filter(
-        pl.col("distance") <= configs_mapped.TokenizerParam().max_dist_candidate,
+def load_concepts(config_name: str) -> pl.DataFrame:
+    configs = get_config(config_name)
+    return pl.read_parquet(configs.ProcessedGraph.concept_w_depth)
+
+
+def load_relations(config_name: str) -> pl.DataFrame:
+    configs = get_config(config_name)
+    return pl.read_parquet(configs.ProcessedGraph().mapped_candidate_rel_dist_prop).filter(
+        pl.col("distance") <= configs.TokenizerParam().max_dist_candidate,
     )
 
 
-def load_candidate_reachable_child_map() -> dict:
-    with open(configs_mapped.ProcessedGraph().candidate_is_a_reachable_dict, "rb") as f:
+def load_candidate_reachable_child_map(config_name: str) -> dict:
+    configs = get_config(config_name)
+    with open(configs.ProcessedGraph().candidate_is_a_reachable_dict, "rb") as f:
         return pickle.load(f)
 
 
-def load_is_a_graph() -> nx.DiGraph:
+def load_df_relation(config_name: str) -> pl.DataFrame:
+    configs = get_config(config_name)
+    return pl.read_parquet(configs.GraphConfig().relation_path)
+
+
+def load_is_a_graph(config_name: str) -> nx.DiGraph:
     """Full SNOMED IS_A graph (child -> parent), used to walk the path between a
     mapped concept's direct neighbor and a candidate sitting further up the hierarchy.
     """
-    df_relation = pl.read_parquet(configs_mapped.GraphConfig().relation_path)
+    df_relation = load_df_relation(config_name)
     return graph_fct.get_is_a_graph(df_relation)
 
 
-def build_tokenizer(concepts: pl.DataFrame, relations: pl.DataFrame, candidate_reachable_child_map: dict) -> GraphTokenizer:
+def build_tokenizer(
+    concepts: pl.DataFrame,
+    relations: pl.DataFrame,
+    df_relation: pl.DataFrame,
+    candidate_reachable_child_map: dict,
+    config_name: str,
+) -> GraphTokenizer:
+    configs = get_config(config_name)
     return GraphTokenizer(
         concepts,
         relations,
+        df_relation,
         candidate_reachable_child_map,
-        configs_mapped.TokenizerParam().max_dist_candidate,
+        configs.TokenizerParam().max_dist_candidate,
     )
 
 
-def get_candidate_ids(method: str, k: int) -> list[str]:
-    baselines_path = configs_mapped.Baselines().path
-    gr_path = configs_mapped.IterativeGraphRed().path
-    mg_path = configs_mapped.IterativeMarginalGain().path
+def get_candidate_ids(config_name: str, method: str, k: int) -> list[str]:
+    configs = get_config(config_name)
+    baselines_path = configs.Baselines().path
+    gr_path = configs.IterativeGraphRed().path
+    mg_path = configs.IterativeMarginalGain().path
 
     if method == "b_random_k":
         df = pl.read_parquet(f"{baselines_path}k_random_all_samples.parquet")
@@ -83,8 +109,8 @@ def get_candidate_ids(method: str, k: int) -> list[str]:
     raise ValueError(f"Unknown method: {method}")
 
 
-def tokenize_for(tokenizer: GraphTokenizer, method: str, k: int):
-    candidate_ids = get_candidate_ids(method, k)
+def tokenize_for(tokenizer: GraphTokenizer, config_name: str, method: str, k: int):
+    candidate_ids = get_candidate_ids(config_name, method, k)
     return tokenizer.evaluate_components_and_tokenize(candidate_ids, debug=False)
 
 
