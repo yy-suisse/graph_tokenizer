@@ -22,6 +22,28 @@ def get_is_a_graph(df_relations, col_src="src.id", col_dst="dst.id") -> nx.DiGra
     return G
 
 
+def build_relations_graph(df_relations, col_src="src.id", col_dst="dst.id", col_relation="relation") -> nx.MultiDiGraph:
+    """
+    Build a directed graph with all relations as edges: src -> dst, labeled with relation type.
+    Uses a MultiDiGraph since a (src, dst) pair can carry more than one relation type.
+    """
+    G = nx.MultiDiGraph()
+    for src, dst, relation in df_relations.select(col_src, col_dst, col_relation).iter_rows():
+        G.add_edge(src, dst, relation=relation)
+    return G
+
+
+def get_subgraphs_from_nodes(G: nx.DiGraph, nodes, max_distance: int = 3) -> dict:
+    """
+    For each node, return the subgraph reachable by following outgoing edges up to
+    max_distance hops. Nodes absent from G map to None.
+    """
+    return {
+        node: nx.ego_graph(G, node, radius=max_distance) if node in G else None
+        for node in nodes
+    }
+
+
 def get_all_descendants(G: nx.DiGraph, concept: str):
     """
     useful for finding all more specific concepts and concept itself in a is-a graph

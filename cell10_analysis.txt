@@ -1,0 +1,5 @@
+cell type code
+source: result = propagate.propagate_n_get_value(edges, flags, verbose=True)
+
+LEN 2199190
+Counter({'0.0': 75222, '0': 404, '0.5': 5, '1': 1, '1.0': 1, '0.16666666666666666': 1, '0.3333333333333333': 1})

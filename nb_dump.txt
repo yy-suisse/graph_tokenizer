@@ -1,0 +1,232 @@
+num cells: 11
+--- cell 0 (markdown) ---
+# basic
+
+--- cell 1 (code) ---
+%load_ext autoreload
+%autoreload all
+
+--- cell 2 (code) ---
+import polars as pl
+import numpy as np
+import pickle
+import itertools
+import networkx as nx
+
+import src.configs_mapped as configs_mapped
+from src.graph_fct import build_relations_graph, get_subgraphs_from_nodes
+import src.propagate as propagate
+
+# from src.tokenizer import GraphTokenizer
+# from src.iterative_selection import iterative_approach_w_graph_red, IterativeMarginalGainMax
+
+--- cell 3 (markdown) ---
+# prepare graph
+
+--- cell 4 (code) ---
+df_relation = pl.read_parquet(f"{configs_mapped.GraphConfig().relation_path}")
+df_concept_path = pl.read_parquet(f"{configs_mapped.GraphConfig().concept_path}")
+
+
+--- cell 5 (code) ---
+# 1. get mapped concepts
+mapped_ids = df_concept_path.filter(pl.col("is_mapped"))["id"].to_list()
+len(mapped_ids)
+OUTPUT: 46150
+
+--- cell 6 (code) ---
+# 0. build 3 hops subgraph from mapped concepts, regardless type of relations
+G = build_relations_graph(df_relation)
+subgraphs = get_subgraphs_from_nodes(G, mapped_ids, max_distance=configs_mapped.TokenizerParam().max_dist_candidate)
+combined = nx.compose_all([sg for sg in subgraphs.values() if sg is not None])
+
+# 1. build subgraph relation table
+df_relations_subgraph = pl.DataFrame(
+    [(u, v, d["relation"]) for u, v, d in combined.edges(data=True)],
+    schema=["src.id", "dst.id", "relation"],
+    orient="row",
+)
+df_direct = df_relations_subgraph.with_columns(distance = 1).unique()
+# df_self = (df_relations_subgraph
+#            .select("src.id")
+#            .with_columns(distance = 0,
+#                            relation = pl.lit("IS_A"))
+#              .with_columns(pl.col("src.id").alias("dst.id"))
+#              .select(df_direct.columns)
+#              .unique())
+# mapped_rel_final = pl.concat([df_direct, df_self])
+
+--- cell 7 (code) ---
+df_direct
+OUTPUT: shape: (290_762, 4)
+┌─────────────────────────────────┬───────────┬───────────────────────┬──────────┐
+│ src.id                          ┆ dst.id    ┆ relation              ┆ distance │
+│ ---                             ┆ ---       ┆ ---                   ┆ ---      │
+│ str                             ┆ str       ┆ str                   ┆ i32      │
+╞═════════════════════════════════╪═══════════╪═══════════════════════╪══════════╡
+│ 29689003                        ┆ 95880003  ┆ IS_A                  ┆ 1        │
+│ 117033003:116686009=168139001,… ┆ 410607006 ┆ COMPONENT             ┆ 1        │
+│ 737669009                       ┆ 11555005  ┆ IS_A                  ┆ 1        │
+│ 707606004                       ┆ 18718003  ┆ IS_A                  ┆ 1        │
+│ 244436004                       ┆ 128319008 ┆ IS_A                  ┆ 1        │
+│ …                               ┆ …         ┆ …                     ┆ …        │
+│ 117033003:116686009=258520000,… ┆ 129265001 ┆ METHOD                ┆ 1        │
+│ 117033003:116686009=472903000,… ┆ 129265001 ┆ METHOD                ┆ 1        │
+│ 241655007                       ┆ 70258002  ┆ PROCEDURE_SITE_DIRECT ┆ 1        │
+│ 117034009:116686009=473411007   ┆ 473411007 ┆ HAS_SPECIMEN          ┆ 1        │
+│ 284550007                       ┆ 733370003 ┆ IS_A                  ┆ 1        │
+└─────────────────────────────────┴───────────┴───────────────────────┴──────────┘
+
+--- cell 8 (markdown) ---
+# prepare input for propagation and sem coverage
+
+--- cell 9 (code) ---
+# 1. find concept propagation depart
+cpt_sources = list(set(df_direct["dst.id"].to_list())-set(df_direct["src.id"].to_list()))
+
+# 2. build the edges
+edges = []
+for row in df_direct.iter_rows(named=True):
+    u = row["src.id"]
+    v = row["dst.id"]
+    edges.append((u,v))
+
+# pick a candidate set and flag
+candidate_test = pl.read_parquet(f"{configs_mapped.IterativeMarginalGain().path}_inv.parquet")["candidate_id"].to_list()
+flags = dict()
+
+for cpt_source in cpt_sources:
+    flags[cpt_source] = 0 # by default setting becasue they shouls have a value
+for candidate in candidate_test: 
+    flags[cpt_source] = 1 # flag candidates to be 1
+
+
+--- cell 10 (code) ---
+result = propagate.propagate_n_get_value(edges, flags, verbose=True)
+
+OUTPUT:   106566009 = 0
+  107620000 = 0
+  4421000146108 = 0
+  279584000 = 0
+  438347000 = 0
+  259582002 = 0
+  422285003 = 0
+  698969006 = 0
+  47822008 = 0
+  54725001 = 0
+  245835003 = 0
+  417595002 = 0
+  699397001 = 0
+  409823008 = 0
+  58815006 = 0
+  227210005 = 0
+  363859000 = 0
+  1495041000004108 = 0
+  115203003 = 0
+  364425000 = 0
+  279426003 = 0
+  243951005 = 0
+  249864002 = 0
+  332807009 = 0
+  1362140001 = 0
+  736680000 = 0
+  426593001 = 0
+  84478008 = 0
+  299998009 = 0
+  717646002 = 0
+  422478000 = 0
+  72353004 = 0
+  427616009 = 0
+  774085002 = 0
+  705731009 = 0
+  120851004 = 0
+  264438009 = 0
+  61344008 = 0
+  407360005 = 0
+  245409005 = 0
+  426663000 = 0
+  284723004 = 0
+  699379009 = 0
+  314399000 = 0
+  305731000 = 0
+  426169000 = 0
+  228955007 = 0
+  409840004 = 0
+  425807007 = 0
+  426872005 = 0
+  427587002 = 0
+  303073003 = 0
+  364263005 = 0
+  768845000 = 0
+  414967003 = 0
+  399794003 = 0
+  225223002 = 0
+  718505003 = 0
+  33986006 = 0
+  114247002 = 0
+  434743009 = 0
+  284349006 = 0
+  734616003 = 0
+  414201007 = 0
+  228780002 = 0
+  364540001 = 0
+  259515008 = 0
+  223394001 = 0
+  767353001 = 0
+  363992005 = 0
+  364176009 = 0
+  53982002 = 0
+  718348005 = 0
+  84230006 = 0
+  106651003 = 0
+  414203005 = 0
+  414228002 = 0
+  425754002 = 0
+  106584006 = 0
+  106597008 = 0
+  255922001 = 0
+  1342382004 = 0
+  243588001 = 0
+  417176000 = 0
+  609043009 = 0
+  1360041005 = 0
+  275390005 = 0
+  304630002 = 0
+  766997002 = 0
+  225220004 = 0
+  15967006 = 0
+  229315006 = 0
+  335901003 = 0
+  699673003 = 0
+  300901001 = 0
+  364153006 = 0
+  279431001 = 0
+  225367003 = 0
+  228859002 = 0
+  1348332002 = 0
+  102717006 = 0
+  314818000 = 0
+  22690006 = 0
+  272089003 = 0
+  703756000 = 0
+  4231000 = 0
+  120669005 = 0
+  107537004 = 0
+  1290206009 = 0
+  303436007 = 0
+  706767009 = 0
+  364493002 = 0
+  425046005 = 0
+  703725008 = 0
+  871491005 = 0
+  26513001 = 0
+  86308005 = 0
+  308408000 = 0
+  106702005 = 0
+  225217007 = 0
+  705330007 = 0
+  37285002 = 0
+  301804000 = 0
+  115178001 = 0
+  363946007 = 0
+
