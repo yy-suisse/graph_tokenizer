@@ -33,15 +33,18 @@ def build_relations_graph(df_relations, col_src="src.id", col_dst="dst.id", col_
     return G
 
 
-def get_subgraphs_from_nodes(G: nx.DiGraph, nodes, max_distance: int = 3) -> dict:
+def get_combined_subgraphs_from_nodes(G: nx.MultiDiGraph, nodes, max_distance: int = 3) -> dict:
     """
     For each node, return the subgraph reachable by following outgoing edges up to
     max_distance hops. Nodes absent from G map to None.
     """
-    return {
+    subgraphs = {
         node: nx.ego_graph(G, node, radius=max_distance) if node in G else None
         for node in nodes
     }
+    return nx.compose_all([sg for sg in subgraphs.values() if sg is not None])
+
+
 
 
 def get_all_descendants(G: nx.DiGraph, concept: str):
