@@ -1,0 +1,290 @@
+import heapq
+
+import numpy as np
+import scipy.sparse as sp
+
+
+class Context:
+    """One node of a context tree.
+    ISA edges stay in the current context; only non-ISA edges open a sub-context."""
+
+    def __init__(self, labels, relation="ROOT", distance=0):
+        self.labels      = labels      # shared id -> label dict
+        self.relation    = relation
+        self.distance    = distance
+        self.destination = None        # concept this subcontext points at (None for ROOT)
+        self.tokens      = []          # [(token, distance)]  <-- single source of truth
+        self.uncovered   = False
+        self.subcontexts = []
+
+    def _label(self, cid):
+        return self.labels.get(cid, cid)   # fall back to the id if not in the map
+
+    def add_token(self, token, distance):
+        self.tokens.append((token, distance))
+
+    def mark_uncovered(self):
+        self.uncovered = True
+
+    def open_subcontext(self, relation, destination, distance):
+        for child in self.subcontexts:
+            if child.relation == relation and child.destination == destination:
+                child.distance = min(child.distance, distance)   # keep most direct
+                return child, False
+        child = Context(self.labels, relation, distance)          # <-- pass labels through
+        child.destination = destination
+        self.subcontexts.append(child)
+        return child, True
+    
+    def to_sexpr(self, show_uncovered=True):
+        items  = [str(tok) for tok, _ in self.tokens]
+        if self.uncovered and show_uncovered:
+            items.append("∅")
+        items += [f"{sub.relation}({sub.to_sexpr(show_uncovered)})"
+                  for sub in self.subcontexts]
+        return ", ".join(items)
+
+    def __repr__(self):
+        return f"({self.to_sexpr()})"
+    # def __repr__(self):
+    #     counter = itertools.count()
+    #     def render(ctx, indent):
+    #         qid, pad = f"q{next(counter)}", "    " * indent
+    #         head = ctx.relation
+    #         if ctx.destination is not None:                       # show what the edge points at
+    #             head += f" → {ctx.destination} ({ctx._label(ctx.destination)})"
+    #         lines = [f"{pad}[{qid}] {head}"]
+    #         for tok, d in ctx.tokens:
+    #             if tok == ctx.destination:            # already shown in the header
+    #                 lines.append(f"{pad}    token: {tok}  (d={d})")
+    #             else:
+    #                 lines.append(f"{pad}    token: {tok} ({ctx._label(tok)})  (d={d})")
+    #         if ctx.uncovered:
+    #             lines.append(f"{pad}    uncovered")
+    #         for sub in ctx.subcontexts:
+    #             lines.append(render(sub, indent + 1))
+    #         return "\n".join(lines)
+    #     return render(self, 0)
+
+def signature(ctx):
+    """Content identity of a context, ignoring distance."""
+    return (
+        ctx.relation,
+        ctx.uncovered,
+        frozenset(tok for tok, _ in ctx.tokens),
+        frozenset(signature(sub) for sub in ctx.subcontexts),
+    )
+
+def collapse_redundant(ctx):
+    for sub in ctx.subcontexts:          # recurse first: resolve nested dups bottom-up
+        collapse_redundant(sub)
+
+    best = {}                            # signature -> shortest-distance subcontext
+    for sub in ctx.subcontexts:
+        key = signature(sub)
+        if key not in best or sub.distance < best[key].distance:
+            best[key] = sub
+    ctx.subcontexts = list(best.values())   # dict preserves first-seen order
+
+    seen = {}                            # same idea for tokens in THIS context
+    for tok, dd in ctx.tokens:
+        if tok not in seen or dd < seen[tok]:
+            seen[tok] = dd
+    ctx.tokens = list(seen.items())
+    return ctx
+
+
+def expand(u, q, d, G, T, D):
+    if u in T:
+        q.add_token(u, d)
+    elif d == D or G.out_degree(u) == 0:
+        q.mark_uncovered()
+    else:
+        # non-IS_A first: the direct (shallower) statement wins; parents' restatements dedup away
+        edges = sorted(G.out_edges(u, data=True),
+                       key=lambda e: e[2]["relation"] == "IS_A")
+        for _, v, data in edges:
+            r = data["relation"]
+            if r == "IS_A":
+                expand(v, q, d + 1, G, T, D)          # transparent, stay in q
+            else:
+                child, is_new = q.open_subcontext(r, v, d + 1)
+                if is_new:
+                    expand(v, child, d + 1, G, T, D)
+    
+def tokenize_all_rel(c, G, T, D, id_to_label):
+    root = Context(id_to_label, "ROOT", distance=0)
+    expand(c, root, 0, G, T, D)
+    # return collapse_redundant(root)
+    return root
+
+
+# --- semantic coverage (Eq. 1) ---------------------------------------------
+
+def build_out_edges(G):
+    """Out(u) = successors of u, one entry per relationship occurrence (multi-edges kept)."""
+    return {u: [v for _, v in G.out_edges(u)] for u in G.nodes()}
+
+
+def compute_semantic_coverage(G, T, D):
+    """
+    Full recomputation of S[h, u] = S_h(u, T) for h = 0..D, u in V = G.nodes() (Eq. 1, §6.2).
+    Layer h only reads layer h-1, so nodes are processed in an arbitrary (non-topological) order;
+    only the horizon loop 0..D needs to be in order.
+
+    Returns S (shape (D+1, |V|)) and node_to_idx (node id -> column in S).
+    """
+    V = list(G.nodes())
+    n = len(V)
+    node_to_idx = {u: i for i, u in enumerate(V)}                 # column each node occupies in S
+    # T_idx: columns of the tokens; index array so we can do S[h, T_idx] = 1 in one vectorized write
+    T_idx = np.fromiter((node_to_idx[t] for t in T if t in node_to_idx), dtype=int)
+
+    # Collect every edge occurrence (u, v) as a (row, col) pair, so that A[i, j] will hold
+    # "how much of u's outgoing weight goes to v" once normalized below. A multi-edge u->v
+    # (two different relation types) contributes two (i, j) pairs, which sp.csr_matrix sums
+    # into a single entry of value 2 -- this is what makes d+(u) come out right after normalizing.
+    out_edges = build_out_edges(G)
+    rows, cols = [], []
+    for u in V:
+        i = node_to_idx[u]
+        for v in out_edges[u]:
+            rows.append(i)
+            cols.append(node_to_idx[v])
+
+    # A[i, j] = number of relationship occurrences from u_i to u_j (raw out-adjacency, unnormalized)
+    A = sp.csr_matrix((np.ones(len(rows)), (rows, cols)), shape=(n, n))
+    out_degree = np.asarray(A.sum(axis=1)).flatten()               # d+(u) for every u, row sums of A
+    # 1 / d+(u), but 0 (not inf) for dead ends (d+(u) = 0) so their row stays all-zero below
+    inv_out_degree = np.divide(1.0, out_degree, out=np.zeros(n), where=out_degree > 0)
+    A = sp.diags(inv_out_degree) @ A          # each row i now sums to 1: A[i, :] @ S[h-1] = mean(S[h-1, v] for v in Out(u_i))
+    # Eq. (1) never averages a token's successors -- S_h(token) = 1 outright -- so zero those
+    # rows out here; the S[h, T_idx] = 1 overrides below then set the correct value directly.
+    A = A.tolil()                              # csr disallows sparsity-changing row assignment; lil allows it
+    A[T_idx, :] = 0
+    A = A.tocsr()                               # back to csr for fast matrix-vector products in the loop
+
+    S = np.zeros((D + 1, n))
+    S[0, T_idx] = 1.0                           # base case, Eq. (1): S_0(u) = 1[u in T], 0 elsewhere (already 0)
+    for h in range(1, D + 1):
+        # one horizon step for every node at once: S[h, u] = mean(S[h-1, v] for v in Out(u)),
+        # 0 for dead ends (their row in A is all zero) -- this is exactly Eq. (1)'s "otherwise" case
+        S[h] = A @ S[h - 1]
+        S[h, T_idx] = 1.0                       # re-apply the token override (A zeroed those rows, so A @ S[h-1] gave 0 there)
+    return S, node_to_idx
+
+
+def semantic_coverage_score(S, node_to_idx, M):
+    """F_D(T) = mean over mapped concepts c in M of S_D(c, T) (Eq. 2)."""
+    idx = [node_to_idx[c] for c in M if c in node_to_idx]  # columns of the mapped concepts in S
+    return S[-1, idx].mean()                               # S[-1] = S[D, :], the last (deepest) horizon row
+
+
+# --- lazy greedy token selection (§6) ---------------------------------------
+
+GREEDY_RATIO = 1 - 1 / np.e   # Nemhauser-Wolsey-Fisher constant: F_D(T_greedy) >= GREEDY_RATIO * OPT (Eq. 5)
+
+
+class LazyGreedyTokenSelector:
+    """
+    Lazy greedy selection of tokens maximizing F_D(T) (§5-6). Maintains S_h(u, T) for the
+    currently committed T and updates it incrementally through CANDIDATE_DELTA/COMMIT (§6.3),
+    instead of rerunning compute_semantic_coverage from scratch after every selected token.
+    """
+
+    def __init__(self, G, M, D):
+        self.G = G
+        self.M = list(M)
+        self.D = D
+        self.V = list(G.nodes())
+        self.node_to_idx = {u: i for i, u in enumerate(self.V)}
+        self.out_degree = {u: G.out_degree(u) for u in self.V}                 # d+(u), static: doesn't depend on T
+        # In(v): predecessors of v, one entry per relationship occurrence (mirrors Out(u)'s multiplicity)
+        self.in_nodes = {v: [u for u, _ in G.in_edges(v)] for v in self.V}
+        self.T = set()
+        self.S = np.zeros((D + 1, len(self.V)))            # S[h, idx(u)] = S_h(u, T) for the current T
+        self.current_score = 0.0                            # F_D(T) for the current T
+
+    def candidate_delta(self, t):
+        """
+        CANDIDATE_DELTA (§6.3, Eq. 6-7): sparse delta_h(u) = S_h(u, T u {t}) - S_h(u, T),
+        propagated backward from t through In(.) edges (only nodes that can reach t within
+        D hops are ever touched). Returns (gain, delta): gain = Delta_D(t | T) (Eq. 8), and
+        delta[h] is a {node: value} dict of the horizon-h changes -- any node not in delta[h]
+        is unaffected (delta 0) by adding t.
+        """
+        idx = self.node_to_idx
+        delta = [None] * (self.D + 1)
+        delta[0] = {t: 1.0 - self.S[0, idx[t]]}                      # Eq. (6): only t changes at horizon 0
+        for h in range(1, self.D + 1):
+            layer = {}
+            for v, dv in delta[h - 1].items():
+                for u in self.in_nodes.get(v, ()):
+                    if u in self.T or u == t:
+                        continue                                     # existing tokens & t itself: handled by the override below, not by propagation
+                    layer[u] = layer.get(u, 0.0) + dv / self.out_degree[u]   # Eq. (7), third case: push v's change onto predecessor u, weighted like Eq. (1)'s average
+            override = 1.0 - self.S[h, idx[t]]
+            if override > 0:
+                layer[t] = override                                  # Eq. (7), first case: t is absorbing at every horizon
+            delta[h] = layer
+        gain = sum(delta[self.D].get(c, 0.0) for c in self.M) / len(self.M)   # Eq. (8)
+        return gain, delta
+
+    def commit(self, t, delta):
+        """COMMIT (§6.1/§6.3): apply the accepted candidate's sparse delta onto S, and add it to T."""
+        idx = self.node_to_idx
+        for h in range(self.D + 1):
+            for u, du in delta[h].items():
+                self.S[h, idx[u]] += du
+        self.T.add(t)
+
+    def select(self, k, candidates=None, verbose=True):
+        """
+        SELECT_TOKENS(k) (§6.1), lazy-greedy variant: keeps one (possibly stale) gain bound
+        per candidate in a max-heap. Submodularity (Proposition 1) guarantees a stale bound is
+        always >= the candidate's true current gain, so recomputing only the heap's current top
+        and comparing it against the next-best stale bound is enough to certify the true maximizer,
+        without recomputing every remaining candidate at every iteration (unlike exact greedy).
+
+        If verbose, prints one line per selected token with:
+          - its rank i/k, id, marginal gain, and cumulative score F_D(T_i);
+          - re-evals: how many stale candidates had to be recomputed this round before the
+            true maximizer was found (a lazy-greedy efficiency indicator -- 1 means the top
+            of the heap was accepted immediately);
+          - opt<=: an upper bound on the best score any T with |T| = i could reach, from the
+            (1 - 1/e) guarantee (Eq. 5): since F_D(T_greedy_i) >= GREEDY_RATIO * OPT_i, we get
+            OPT_i <= F_D(T_greedy_i) / GREEDY_RATIO. The guarantee holds at every prefix size,
+            not just the final k, so this bound is meaningful after each token, not only at the end.
+
+        Returns the selection history as a list of (token, marginal_gain, cumulative_score),
+        in the order tokens were picked.
+        """
+        candidates = self.V if candidates is None else candidates
+        heap = []                                                    # (-gain, token): heapq is a min-heap, negate for max-heap
+        for t in candidates:
+            if t in self.T:
+                continue
+            gain, _ = self.candidate_delta(t)                        # initial gains are exact (§6.1 comment)
+            heapq.heappush(heap, (-gain, t))
+
+        history = []
+        while len(self.T) < k and heap:
+            n_evals = 0
+            while True:
+                _, t = heapq.heappop(heap)
+                gain, delta = self.candidate_delta(t)                 # recompute exactly for the current top
+                n_evals += 1
+                best_other_bound = -heap[0][0] if heap else float("-inf")
+                if gain >= best_other_bound:                          # true maximizer: nothing else in the queue can beat it
+                    self.commit(t, delta)
+                    self.current_score += gain
+                    history.append((t, gain, self.current_score))
+                    if verbose:
+                        i = len(self.T)
+                        opt_upper_bound = min(1.0, self.current_score / GREEDY_RATIO)   # F_D <= 1 always (§4), so clip the loose (1-1/e) bound
+                        print(f"[{i:>4}/{k}] token={t!r:<15} gain={gain:.5f}  "
+                              f"score={self.current_score:.5f}  opt<={opt_upper_bound:.5f}  "
+                              f"(re-evals={n_evals}, queue={len(heap)})")
+                    break
+                heapq.heappush(heap, (-gain, t))                       # stale bound: re-queue with the freshly computed gain
+        return history
