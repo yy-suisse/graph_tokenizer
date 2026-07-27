@@ -1,4 +1,6 @@
 import heapq
+import multiprocessing as mp
+import os
 
 import numpy as np
 import scipy.sparse as sp
@@ -136,9 +138,13 @@ def compute_semantic_coverage(G, T, D):
     """
     V = list(G.nodes())
     n = len(V)
+
+    # 1.  index the nodes
     node_to_idx = {u: i for i, u in enumerate(V)}                 # column each node occupies in S
     # T_idx: columns of the tokens; index array so we can do S[h, T_idx] = 1 in one vectorized write
     T_idx = np.fromiter((node_to_idx[t] for t in T if t in node_to_idx), dtype=int)
+
+    # 2. collect every edge occurrence as (row, col) pairs
 
     # Collect every edge occurrence (u, v) as a (row, col) pair, so that A[i, j] will hold
     # "how much of u's outgoing weight goes to v" once normalized below. A multi-edge u->v
@@ -152,6 +158,7 @@ def compute_semantic_coverage(G, T, D):
             rows.append(i)
             cols.append(node_to_idx[v])
 
+    # 3. build the raw adjacency matrix and normalize by out-degree
     # A[i, j] = number of relationship occurrences from u_i to u_j (raw out-adjacency, unnormalized)
     A = sp.csr_matrix((np.ones(len(rows)), (rows, cols)), shape=(n, n))
     out_degree = np.asarray(A.sum(axis=1)).flatten()               # d+(u) for every u, row sums of A
@@ -161,11 +168,16 @@ def compute_semantic_coverage(G, T, D):
     # Eq. (1) never averages a token's successors -- S_h(token) = 1 outright -- so zero those
     # rows out here; the S[h, T_idx] = 1 overrides below then set the correct value directly.
     A = A.tolil()                              # csr disallows sparsity-changing row assignment; lil allows it
+
+    # 4. zero out the token rows 
     A[T_idx, :] = 0
     A = A.tocsr()                               # back to csr for fast matrix-vector products in the loop
 
+    # 5. base case, h = 0
     S = np.zeros((D + 1, n))
     S[0, T_idx] = 1.0                           # base case, Eq. (1): S_0(u) = 1[u in T], 0 elsewhere (already 0)
+
+    # 6. one matrix multiply per horizon
     for h in range(1, D + 1):
         # one horizon step for every node at once: S[h, u] = mean(S[h-1, v] for v in Out(u)),
         # 0 for dead ends (their row in A is all zero) -- this is exactly Eq. (1)'s "otherwise" case
@@ -183,6 +195,55 @@ def semantic_coverage_score(S, node_to_idx, M):
 # --- lazy greedy token selection (§6) ---------------------------------------
 
 GREEDY_RATIO = 1 - 1 / np.e   # Nemhauser-Wolsey-Fisher constant: F_D(T_greedy) >= GREEDY_RATIO * OPT (Eq. 5)
+
+
+def _candidate_delta_core(t, node_to_idx, D, S, in_nodes, out_degree, T, M):
+    """
+    Pure-function core of CANDIDATE_DELTA (§6.3, Eq. 6-7): sparse delta_h(u) =
+    S_h(u, T u {t}) - S_h(u, T), propagated backward from t through in_nodes (only nodes
+    that can reach t within D hops are touched). Takes plain picklable arguments (no
+    `self`) so it can run identically inside a worker process or as an instance method.
+    Returns (gain, delta): gain = Delta_D(t | T) (Eq. 8); 
+    delta[h] is a {node: value}: dict of horizon-h changes, any node not in it is unaffected (delta 0) by adding t.
+    """
+    idx = node_to_idx
+    delta = [None] * (D + 1)
+    delta[0] = {t: 1.0 - S[0, idx[t]]}                           # Eq. (6): only t changes at horizon 0
+    for h in range(1, D + 1):
+        layer = {}
+        for v, dv in delta[h - 1].items():
+            for u in in_nodes.get(v, ()):
+                if u in T or u == t:
+                    continue                                     # existing tokens & t itself: handled by the override below, not by propagation
+                layer[u] = layer.get(u, 0.0) + dv / out_degree[u]   # Eq. (7), third case: push v's change onto predecessor u, weighted like Eq. (1)'s average
+        override = 1.0 - S[h, idx[t]]
+        if override > 0:
+            layer[t] = override                                  # Eq. (7), first case: t is absorbing at every horizon
+        delta[h] = layer
+    gain = sum(delta[D].get(c, 0.0) for c in M) / len(M)          # Eq. (8)
+    return gain, delta
+
+
+_WORKER_STATE = {}   # per-process globals, populated once by _init_worker (avoids re-pickling on every task)
+
+
+def _init_worker(node_to_idx, D, S, in_nodes, out_degree, T, M):
+    """Pool(initializer=...) target: stash the read-only selector state once per worker process."""
+    _WORKER_STATE.update(node_to_idx=node_to_idx, D=D, S=S, in_nodes=in_nodes,
+                          out_degree=out_degree, T=T, M=M)
+
+
+def _worker_seed_gain(t):
+    """
+    Pool task target for the initial candidate scan. Only returns (t, gain), not the delta:
+    the paper's own SELECT_TOKENS pseudocode discards the delta from the initial seeding call
+    ("gain, unused_delta = CANDIDATE_DELTA(t)") since it will be recomputed anyway once (if)
+    the candidate reaches the top of the heap -- so there's no reason to ship the (potentially
+    large) delta dict back over IPC.
+    """
+    st = _WORKER_STATE
+    gain, _ = _candidate_delta_core(t, st["node_to_idx"], st["D"], st["S"], st["in_nodes"], st["out_degree"], st["T"], st["M"])
+    return t, gain
 
 
 class LazyGreedyTokenSelector:
@@ -206,29 +267,8 @@ class LazyGreedyTokenSelector:
         self.current_score = 0.0                            # F_D(T) for the current T
 
     def candidate_delta(self, t):
-        """
-        CANDIDATE_DELTA (§6.3, Eq. 6-7): sparse delta_h(u) = S_h(u, T u {t}) - S_h(u, T),
-        propagated backward from t through In(.) edges (only nodes that can reach t within
-        D hops are ever touched). Returns (gain, delta): gain = Delta_D(t | T) (Eq. 8), and
-        delta[h] is a {node: value} dict of the horizon-h changes -- any node not in delta[h]
-        is unaffected (delta 0) by adding t.
-        """
-        idx = self.node_to_idx
-        delta = [None] * (self.D + 1)
-        delta[0] = {t: 1.0 - self.S[0, idx[t]]}                      # Eq. (6): only t changes at horizon 0
-        for h in range(1, self.D + 1):
-            layer = {}
-            for v, dv in delta[h - 1].items():
-                for u in self.in_nodes.get(v, ()):
-                    if u in self.T or u == t:
-                        continue                                     # existing tokens & t itself: handled by the override below, not by propagation
-                    layer[u] = layer.get(u, 0.0) + dv / self.out_degree[u]   # Eq. (7), third case: push v's change onto predecessor u, weighted like Eq. (1)'s average
-            override = 1.0 - self.S[h, idx[t]]
-            if override > 0:
-                layer[t] = override                                  # Eq. (7), first case: t is absorbing at every horizon
-            delta[h] = layer
-        gain = sum(delta[self.D].get(c, 0.0) for c in self.M) / len(self.M)   # Eq. (8)
-        return gain, delta
+        """CANDIDATE_DELTA (§6.3, Eq. 6-7) against the currently committed T/S. See _candidate_delta_core."""
+        return _candidate_delta_core(t, self.node_to_idx, self.D, self.S, self.in_nodes, self.out_degree, self.T, self.M)
 
     def commit(self, t, delta):
         """COMMIT (§6.1/§6.3): apply the accepted candidate's sparse delta onto S, and add it to T."""
@@ -238,13 +278,24 @@ class LazyGreedyTokenSelector:
                 self.S[h, idx[u]] += du
         self.T.add(t)
 
-    def select(self, k, candidates=None, verbose=True):
+    def select(self, k, candidates=None, verbose=True, n_jobs=1, progress_every=5000):
         """
         SELECT_TOKENS(k) (§6.1), lazy-greedy variant: keeps one (possibly stale) gain bound
         per candidate in a max-heap. Submodularity (Proposition 1) guarantees a stale bound is
         always >= the candidate's true current gain, so recomputing only the heap's current top
         and comparing it against the next-best stale bound is enough to certify the true maximizer,
         without recomputing every remaining candidate at every iteration (unlike exact greedy).
+
+        Before the loop starts, every candidate needs one *exact* initial gain to seed the heap
+        (§6.1: "Initial gains are exact") -- this one-time pass is O(|candidates|) CANDIDATE_DELTA
+        calls and is the dominant cost on a large graph (e.g. ~75k candidates), yet it produces no
+        output on its own since nothing has been selected yet. progress_every prints a line every
+        that many candidates scored (in both this phase and, further below, the greedy loop) so it
+        doesn't look hung. n_jobs parallelizes exactly this initial scan across worker processes --
+        each candidate's initial gain only depends on the fixed T/S at call time, so the scan is
+        embarrassingly parallel. n_jobs=1 (default) runs it serially (no subprocess overhead, fine
+        for small graphs); n_jobs=-1 uses all CPU cores. The lazy loop itself is left serial: with
+        the observed ~1-7 re-evals per accepted token, IPC overhead would dominate any speedup there.
 
         If verbose, prints one line per selected token with:
           - its rank i/k, id, marginal gain, and cumulative score F_D(T_i);
@@ -260,12 +311,26 @@ class LazyGreedyTokenSelector:
         in the order tokens were picked.
         """
         candidates = self.V if candidates is None else candidates
+        candidates = [t for t in candidates if t not in self.T]
+        n_candidates = len(candidates)
         heap = []                                                    # (-gain, token): heapq is a min-heap, negate for max-heap
-        for t in candidates:
-            if t in self.T:
-                continue
-            gain, _ = self.candidate_delta(t)                        # initial gains are exact (§6.1 comment)
-            heapq.heappush(heap, (-gain, t))
+
+        if n_jobs == 1:
+            for i, t in enumerate(candidates, 1):
+                gain, _ = self.candidate_delta(t)                    # initial gains are exact (§6.1 comment)
+                heapq.heappush(heap, (-gain, t))
+                if verbose and (i % progress_every == 0 or i == n_candidates):
+                    print(f"  seeding candidates: {i}/{n_candidates}")
+        else:
+            n_workers = os.cpu_count() if n_jobs == -1 else n_jobs
+            init_args = (self.node_to_idx, self.D, self.S, self.in_nodes, self.out_degree, self.T, self.M)
+            with mp.Pool(n_workers, initializer=_init_worker, initargs=init_args) as pool:
+                if verbose:
+                    print(f"  seeding candidates: 0/{n_candidates}  ({n_workers} workers)")
+                for i, (t, gain) in enumerate(pool.imap_unordered(_worker_seed_gain, candidates, chunksize=64), 1):
+                    heapq.heappush(heap, (-gain, t))
+                    if verbose and (i % progress_every == 0 or i == n_candidates):
+                        print(f"  seeding candidates: {i}/{n_candidates}  ({n_workers} workers)")
 
         history = []
         while len(self.T) < k and heap:
