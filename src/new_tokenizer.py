@@ -128,11 +128,18 @@ def build_out_edges(G):
     return {u: [v for _, v in G.out_edges(u)] for u in G.nodes()}
 
 
-def compute_semantic_coverage(G, T, D):
+def compute_semantic_coverage(G, T, D, lam=1.0):
     """
     Full recomputation of S[h, u] = S_h(u, T) for h = 0..D, u in V = G.nodes() (Eq. 1, §6.2).
     Layer h only reads layer h-1, so nodes are processed in an arbitrary (non-topological) order;
     only the horizon loop 0..D needs to be in order.
+
+    lam (0 < lam <= 1): distance/horizon penalty. Modified Eq. (1), third case:
+        S_h(u, T) = lam * mean(S_{h-1}(v) for v in Out(u))
+    Each hop taken multiplies by lam once, so a token found j hops away contributes lam**j
+    instead of 1 (lam=1 recovers the original Eq. 1 exactly). Preserves F_D's normalized /
+    monotone / submodular properties (Proposition 1), so the (1-1/e) greedy guarantee (Eq. 5)
+    still holds for any lam in (0, 1].
 
     Returns S (shape (D+1, |V|)) and node_to_idx (node id -> column in S).
     """
@@ -150,9 +157,16 @@ def compute_semantic_coverage(G, T, D):
     # "how much of u's outgoing weight goes to v" once normalized below. A multi-edge u->v
     # (two different relation types) contributes two (i, j) pairs, which sp.csr_matrix sums
     # into a single entry of value 2 -- this is what makes d+(u) come out right after normalizing.
+    # Token nodes are skipped here rather than zeroed afterward: Eq. 1 never averages a token's
+    # successors (S_h(token) = 1 outright, applied via the S[h, T_idx] = 1 overrides below), and
+    # a post-hoc `A[T_idx, :] = 0` on a lil_matrix broadcasts a dense (len(T_idx), n) array
+    # internally, which OOMs once |T| and |V| are both large (e.g. k=11500, |V|=75635 -> 6.5 GiB).
+    T_set = set(T)
     out_edges = build_out_edges(G)
     rows, cols = [], []
     for u in V:
+        if u in T_set:
+            continue
         i = node_to_idx[u]
         for v in out_edges[u]:
             rows.append(i)
@@ -162,22 +176,17 @@ def compute_semantic_coverage(G, T, D):
     # A[i, j] = number of relationship occurrences from u_i to u_j (raw out-adjacency, unnormalized)
     A = sp.csr_matrix((np.ones(len(rows)), (rows, cols)), shape=(n, n))
     out_degree = np.asarray(A.sum(axis=1)).flatten()               # d+(u) for every u, row sums of A
-    # 1 / d+(u), but 0 (not inf) for dead ends (d+(u) = 0) so their row stays all-zero below
+    # 1 / d+(u), but 0 (not inf) for dead ends (d+(u) = 0) -- token rows are dead ends here since
+    # their edges were skipped above, so their row in A is already all-zero
     inv_out_degree = np.divide(1.0, out_degree, out=np.zeros(n), where=out_degree > 0)
     A = sp.diags(inv_out_degree) @ A          # each row i now sums to 1: A[i, :] @ S[h-1] = mean(S[h-1, v] for v in Out(u_i))
-    # Eq. (1) never averages a token's successors -- S_h(token) = 1 outright -- so zero those
-    # rows out here; the S[h, T_idx] = 1 overrides below then set the correct value directly.
-    A = A.tolil()                              # csr disallows sparsity-changing row assignment; lil allows it
+    A = lam * A                                # distance penalty: one factor of lam per hop, folded into the same matrix
 
-    # 4. zero out the token rows 
-    A[T_idx, :] = 0
-    A = A.tocsr()                               # back to csr for fast matrix-vector products in the loop
-
-    # 5. base case, h = 0
+    # 4. base case, h = 0
     S = np.zeros((D + 1, n))
     S[0, T_idx] = 1.0                           # base case, Eq. (1): S_0(u) = 1[u in T], 0 elsewhere (already 0)
 
-    # 6. one matrix multiply per horizon
+    # 5. one matrix multiply per horizon
     for h in range(1, D + 1):
         # one horizon step for every node at once: S[h, u] = mean(S[h-1, v] for v in Out(u)),
         # 0 for dead ends (their row in A is all zero) -- this is exactly Eq. (1)'s "otherwise" case
@@ -192,19 +201,50 @@ def semantic_coverage_score(S, node_to_idx, M):
     return S[-1, idx].mean()                               # S[-1] = S[D, :], the last (deepest) horizon row
 
 
+_COVERAGE_WORKER_STATE = {}   # per-process globals, populated once by _init_coverage_worker (avoids re-pickling G/M on every task)
+
+
+def _init_coverage_worker(G, M, D, id_to_label=None, lam=1.0):
+    """Pool(initializer=...) target: stash the read-only graph/mapped-ids once per worker process."""
+    _COVERAGE_WORKER_STATE.update(G=G, M=M, D=D, id_to_label=id_to_label, lam=lam)
+
+
+def _worker_coverage_score(task):
+    """
+    Pool task target for scoring one (label, T) pair against the shared G/M/D/lam stashed by
+    _init_coverage_worker. `label` is opaque to this function -- it's just carried through so the
+    caller can match results back to their (k, iter) / (category, file_type, k) origin after
+    imap_unordered reorders them. Returns (label, metrics) where metrics is eval.evaluate's dict
+    (conciseness, distance_score, uniqueness_entropy, unk_rate, tree_complexity, exact_rate) plus
+    semantic_coverage -- both computed from the same T against the same shared G/M, so bundling
+    them here avoids building the context trees or shipping T over IPC twice.
+    """
+    from src.eval import evaluate as eval_all_metrics  # local import: eval.py imports from this module at load time, so importing it back at module level here would cycle
+
+    label, T = task
+    st = _COVERAGE_WORKER_STATE
+    S, node_to_idx = compute_semantic_coverage(st["G"], T, st["D"], st["lam"])
+    metrics = eval_all_metrics(st["M"], st["G"], T, st["D"], st["id_to_label"])
+    metrics["semantic_coverage"] = semantic_coverage_score(S, node_to_idx, st["M"])
+    return label, metrics
+
+
 # --- lazy greedy token selection (§6) ---------------------------------------
 
 GREEDY_RATIO = 1 - 1 / np.e   # Nemhauser-Wolsey-Fisher constant: F_D(T_greedy) >= GREEDY_RATIO * OPT (Eq. 5)
 
 
-def _candidate_delta_core(t, node_to_idx, D, S, in_nodes, out_degree, T, M):
+def _candidate_delta_core(t, node_to_idx, D, S, in_nodes, out_degree, T, M, lam=1.0):
     """
     Pure-function core of CANDIDATE_DELTA (§6.3, Eq. 6-7): sparse delta_h(u) =
     S_h(u, T u {t}) - S_h(u, T), propagated backward from t through in_nodes (only nodes
     that can reach t within D hops are touched). Takes plain picklable arguments (no
     `self`) so it can run identically inside a worker process or as an instance method.
-    Returns (gain, delta): gain = Delta_D(t | T) (Eq. 8); 
+    Returns (gain, delta): gain = Delta_D(t | T) (Eq. 8);
     delta[h] is a {node: value}: dict of horizon-h changes, any node not in it is unaffected (delta 0) by adding t.
+
+    lam (0 < lam <= 1): same distance/horizon penalty as compute_semantic_coverage's lam,
+    applied to Eq. (7)'s third case so the incremental computation matches the modified Eq. (1).
     """
     idx = node_to_idx
     delta = [None] * (D + 1)
@@ -215,7 +255,7 @@ def _candidate_delta_core(t, node_to_idx, D, S, in_nodes, out_degree, T, M):
             for u in in_nodes.get(v, ()):
                 if u in T or u == t:
                     continue                                     # existing tokens & t itself: handled by the override below, not by propagation
-                layer[u] = layer.get(u, 0.0) + dv / out_degree[u]   # Eq. (7), third case: push v's change onto predecessor u, weighted like Eq. (1)'s average
+                layer[u] = layer.get(u, 0.0) + lam * dv / out_degree[u]   # Eq. (7), third case: push v's change onto predecessor u, weighted like Eq. (1)'s average, with the lam distance penalty
         override = 1.0 - S[h, idx[t]]
         if override > 0:
             layer[t] = override                                  # Eq. (7), first case: t is absorbing at every horizon
@@ -227,10 +267,10 @@ def _candidate_delta_core(t, node_to_idx, D, S, in_nodes, out_degree, T, M):
 _WORKER_STATE = {}   # per-process globals, populated once by _init_worker (avoids re-pickling on every task)
 
 
-def _init_worker(node_to_idx, D, S, in_nodes, out_degree, T, M):
+def _init_worker(node_to_idx, D, S, in_nodes, out_degree, T, M, lam):
     """Pool(initializer=...) target: stash the read-only selector state once per worker process."""
     _WORKER_STATE.update(node_to_idx=node_to_idx, D=D, S=S, in_nodes=in_nodes,
-                          out_degree=out_degree, T=T, M=M)
+                          out_degree=out_degree, T=T, M=M, lam=lam)
 
 
 def _worker_seed_gain(t):
@@ -242,7 +282,7 @@ def _worker_seed_gain(t):
     large) delta dict back over IPC.
     """
     st = _WORKER_STATE
-    gain, _ = _candidate_delta_core(t, st["node_to_idx"], st["D"], st["S"], st["in_nodes"], st["out_degree"], st["T"], st["M"])
+    gain, _ = _candidate_delta_core(t, st["node_to_idx"], st["D"], st["S"], st["in_nodes"], st["out_degree"], st["T"], st["M"], st["lam"])
     return t, gain
 
 
@@ -253,10 +293,11 @@ class LazyGreedyTokenSelector:
     instead of rerunning compute_semantic_coverage from scratch after every selected token.
     """
 
-    def __init__(self, G, M, D):
+    def __init__(self, G, M, D, lam=1.0):
         self.G = G
         self.M = list(M)
         self.D = D
+        self.lam = lam                                      # distance/horizon penalty, Eq. (1)/(7) third case (0 < lam <= 1; 1 = no penalty)
         self.V = list(G.nodes())
         self.node_to_idx = {u: i for i, u in enumerate(self.V)}
         self.out_degree = {u: G.out_degree(u) for u in self.V}                 # d+(u), static: doesn't depend on T
@@ -268,7 +309,7 @@ class LazyGreedyTokenSelector:
 
     def candidate_delta(self, t):
         """CANDIDATE_DELTA (§6.3, Eq. 6-7) against the currently committed T/S. See _candidate_delta_core."""
-        return _candidate_delta_core(t, self.node_to_idx, self.D, self.S, self.in_nodes, self.out_degree, self.T, self.M)
+        return _candidate_delta_core(t, self.node_to_idx, self.D, self.S, self.in_nodes, self.out_degree, self.T, self.M, self.lam)
 
     def commit(self, t, delta):
         """COMMIT (§6.1/§6.3): apply the accepted candidate's sparse delta onto S, and add it to T."""
@@ -323,7 +364,7 @@ class LazyGreedyTokenSelector:
                     print(f"  seeding candidates: {i}/{n_candidates}")
         else:
             n_workers = os.cpu_count() if n_jobs == -1 else n_jobs
-            init_args = (self.node_to_idx, self.D, self.S, self.in_nodes, self.out_degree, self.T, self.M)
+            init_args = (self.node_to_idx, self.D, self.S, self.in_nodes, self.out_degree, self.T, self.M, self.lam)
             with mp.Pool(n_workers, initializer=_init_worker, initargs=init_args) as pool:
                 if verbose:
                     print(f"  seeding candidates: 0/{n_candidates}  ({n_workers} workers)")
