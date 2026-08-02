@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "app",
+      "runtimeExecutable": "streamlit",
+      "runtimeArgs": ["run", "app.py"],
+      "port": 8501
+    },
+    {
+      "name": "app_new_tokenizer",
+      "runtimeExecutable": "streamlit",
+      "runtimeArgs": ["run", "app_new_tokenizer.py", "--server.port", "8502"],
+      "port": 8502
+    }
+  ]
+}
